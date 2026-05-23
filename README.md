@@ -1,1 +1,171 @@
-# Sports_betting-
+# Sports Betting Intelligence Bot
+
+> Multi-league football value betting analysis: real-time odds, mispricing detection, optional AI risk scoring, and automatic Kelly sizing.
+
+---
+
+## Features
+
+- **Value Bet Detection** — EV% and Kelly stake calculation from multi-bookmaker odds
+- **Market Intelligence** — steam move detection, bookmaker spread, DRIFTING/SHORTENING/STABLE consensus
+- **xG Integration** — Expected Goals enrichment from Understat for EPL, La Liga, Serie A, Bundesliga, Ligue 1
+- **AI Risk Scoring** — GPT-4o / Gemini / Ollama as risk analyst (optional, can be skipped)
+- **CQS Score** — Composite Quality Score for final pick ranking
+- **Kelly Sizing** — half-Kelly with automatic league quality multiplier
+- **Pick Tracker** — log bet results and generate weekly reports to `picks_log.csv`
+- **Rich UI** — interactive terminal dashboard with auto-refresh
+
+---
+
+## Installation
+
+```powershell
+# Clone the repo
+git clone https://github.com/username/sports-betting-bot.git
+cd sports-betting-bot
+
+# Install dependencies
+py -m pip install -r requirements.txt
+
+# Set up configuration
+copy .env.example .env
+# → Edit .env and fill in the required API keys
+
+# Run without any API key (mock mode)
+py main.py --no-ai
+```
+
+---
+
+## API Key Configuration
+
+Copy `.env.example` to `.env` and fill in the keys you need:
+
+```powershell
+copy .env.example .env
+```
+
+| Key | Source | Required? |
+|---|---|---|
+| `ODDS_API_IO_KEY` | [odds-api.io](https://odds-api.io) | ✅ For live data |
+| `THE_ODDS_API_KEY` | [the-odds-api.com](https://the-odds-api.com) | Alternative |
+| `GITHUB_TOKEN` | [github.com/settings/tokens](https://github.com/settings/tokens) | For AI (GPT-4o) |
+| `GOOGLE_AI_STUDIO_KEY` | [aistudio.google.com](https://aistudio.google.com/app/apikey) | For AI (Gemini) |
+| `OLLAMA_API_KEY` | [ollama.com](https://ollama.com/settings/keys) | For local AI |
+| `FOOTBALL_DATA_KEY` | [football-data.org](https://www.football-data.org/client/register) | Auto-update results |
+
+> **Note**: Never commit API keys. `api_keys.py` and `.env` are already listed in `.gitignore`.
+
+You can also store keys locally in `api_keys.py` (git-ignored, safe for local use):
+
+```python
+# api_keys.py  ← this file is gitignored, safe to store your keys here
+ODDS_API_IO_KEY = "your_key_here"
+GITHUB_TOKEN    = "ghp_..."
+```
+
+---
+
+## Usage
+
+```powershell
+# Main dashboard
+py main.py
+
+# Force live data (requires an odds API key)
+py main.py --live
+
+# Skip AI enrichment (faster)
+py main.py --no-ai
+
+# Auto-refresh every 60 seconds
+py main.py --watch
+
+# Match detail view
+py main.py --detail "Arsenal"
+
+# Custom parameters
+py main.py --edge 3 --bankroll 5000 --lookahead 24
+
+# Show active configuration
+py main.py --config
+```
+
+---
+
+## Pick Tracker
+
+```powershell
+# Copy the template first
+copy picks_log.csv.example picks_log.csv
+
+# Weekly report (last week)
+python tracker.py --report
+
+# Two weeks ago
+python tracker.py --report 2
+
+# All historical data
+python tracker.py --all
+
+# Manually update a result
+python tracker.py --update "Arsenal vs Chelsea" WIN --pnl 45000
+
+# Auto-scrape results from football-data.org
+python tracker.py --auto-results
+```
+
+---
+
+## Markets Analyzed
+
+- **Match Result / 1X2** — including LAY bets (back draw/away to lose)
+- **Over/Under Goals** — per line (Over 2.5, Over 3.5, etc.)
+- **Asian Handicap** — Team +1.5, -0.5, etc.
+- **Both Teams to Score**
+
+---
+
+## AI Provider
+
+The bot selects an AI provider automatically based on available keys:
+
+1. **GitHub Models (GPT-4o)** — default if `GITHUB_TOKEN` is set
+2. **Google Gemini** — fallback if `GOOGLE_AI_STUDIO_KEY` is set
+3. **Ollama** — local or cloud via `OLLAMA_API_KEY`
+4. **No-AI mode** — skip enrichment, use statistical calculation only
+
+```powershell
+# Override the GitHub Models model
+py main.py --model "gpt-4o-mini"
+
+# Skip AI entirely
+py main.py --no-ai
+```
+
+AI is only invoked for bets that pass `min_ev_for_llm` to preserve quota.
+
+---
+
+## Disclaimer
+
+> This is a research tool, not a guarantee of profit. Use conservative stakes, limit your bankroll exposure, and treat extreme edges as possible data errors. Bet responsibly.
+
+---
+
+## Changelog
+
+### v1.2 — May 2026
+
+- Market Intelligence Prompt: odds spread, steam direction, SHARP vs SOFT classification
+- Risk Score System: AI output changed from BUY/AVOID to `risk_score` on a 0–10 scale
+- League Quality Multiplier: Kelly stake scaled automatically per league
+- CQS (Composite Quality Score): multi-dimensional final pick ranking
+
+### v1.1 — May 2026
+
+- Automatic pick tracking to `picks_log.csv`
+- xG Integration via Understat (EPL, La Liga, Serie A, Bundesliga, Ligue 1)
+- AI Prompt refactor: GPT-4o as a pure risk analyst
+- `LLM_TRUST_FACTOR` raised from 0.3 → 0.5
+- Interactive menu with inline weekly report

@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+rich>=13.7.0
+ollama>=0.3.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0

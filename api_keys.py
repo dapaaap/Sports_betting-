@@ -1,0 +1,11 @@
+ODDS_PROVIDER = "the_odds_api"
+
+THE_ODDS_API_KEY = ""
+
+ODDS_API_IO_KEY = ""
+
+GOOGLE_AI_STUDIO_KEY = ""
+
+GITHUB_TOKEN = ""
+
+OLLAMA_API_KEY = ""
