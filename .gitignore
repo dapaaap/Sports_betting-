@@ -23,6 +23,8 @@ api_keys.py
 
 # Data pribadi & log
 picks_log.csv
+historical_*.csv
+historical_*.csv.bak
 *.log
 logs/
 

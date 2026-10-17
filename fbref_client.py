@@ -2,6 +2,7 @@
 import difflib
 import logging
 import math
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,13 @@ import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
+
+_cloudscraper_warning_logged = False
 
 
 FBREF_LEAGUES: Dict[str, Dict[str, Any]] = {
@@ -196,13 +204,25 @@ class FBrefEnricher:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     )
-    REQUEST_DELAY = 1.5
 
     def __init__(self, cache_ttl: int = 600):
+        global _cloudscraper_warning_logged
+
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._last_request_ts: float = 0.0
-        self._session = requests.Session()
+        self._circuit_open = False
+        self._circuit_reason = ""
+        if cloudscraper is None and not _cloudscraper_warning_logged:
+            logger.warning(
+                "cloudscraper not installed; falling back to requests for FBref access"
+            )
+            _cloudscraper_warning_logged = True
+        self._session = (
+            cloudscraper.create_scraper()
+            if cloudscraper is not None
+            else requests.Session()
+        )
         self._session.headers.update(
             {
                 "User-Agent": self.USER_AGENT,
@@ -226,8 +246,9 @@ class FBrefEnricher:
 
     def _rate_limit(self) -> None:
         elapsed = time.time() - self._last_request_ts
-        if elapsed < self.REQUEST_DELAY:
-            time.sleep(self.REQUEST_DELAY - elapsed)
+        delay = random.uniform(3, 7)
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
         self._last_request_ts = time.time()
 
     def _build_url(self, comp_id: int, league_name: str, season: str) -> str:
@@ -240,6 +261,8 @@ class FBrefEnricher:
         )
 
     def _fetch_page(self, url: str) -> Optional[str]:
+        if self._circuit_open:
+            return None
         self._rate_limit()
         try:
             resp = self._session.get(url, timeout=15)
@@ -248,6 +271,15 @@ class FBrefEnricher:
             elif resp.status_code == 429:
                 logger.warning("FBref: Rate limited (429). Backing off 10s...")
                 time.sleep(10)
+                return None
+            elif resp.status_code == 403:
+                snippet = re.sub(r"\s+", " ", resp.text[:240]).strip()
+                self._circuit_open = True
+                self._circuit_reason = f"HTTP 403 / possible Cloudflare block: {snippet}"
+                logger.warning(
+                    "FBref access blocked; disabling FBref for this run. %s",
+                    self._circuit_reason,
+                )
                 return None
             else:
                 logger.warning(f"FBref: HTTP {resp.status_code} for {url}")
@@ -302,8 +334,16 @@ class FBrefEnricher:
             if away_team not in team_names_seen:
                 team_names_seen.append(away_team)
 
-            if not score or score == "":
-                continue
+            home_goals, away_goals = None, None
+            if score:
+                score_clean = score.replace("–", "-")
+                m_score = re.search(r"(\d+)\s*-\s*(\d+)", score_clean)
+                if m_score:
+                    try:
+                        home_goals = int(m_score.group(1))
+                        away_goals = int(m_score.group(2))
+                    except ValueError:
+                        pass
 
             try:
                 h_xg = float(home_xg) if home_xg else None
@@ -319,6 +359,8 @@ class FBrefEnricher:
                         "away_team": away_team.strip(),
                         "home_xg": h_xg,
                         "away_xg": a_xg,
+                        "home_goals": home_goals,
+                        "away_goals": away_goals,
                     }
                 )
 
@@ -339,6 +381,10 @@ class FBrefEnricher:
         cached = self._get_from_cache(cache_key)
         if cached is not None:
             return cached
+
+        if self._circuit_open:
+            logger.debug("FBref circuit open; skipping %s", sport_key)
+            return None
 
         comp_id = league_info["comp_id"]
         league_name = league_info["name"]
@@ -466,6 +512,8 @@ class FBrefEnricher:
 
     def enrich_matches(self, matches: List[Dict], season: str) -> List[Dict]:
         for match in matches:
+            if self._circuit_open:
+                break
             if match.get("xg_context") is not None:
                 continue
 

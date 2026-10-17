@@ -13,39 +13,25 @@ from config import ANALYSIS_CONFIG, GOOGLE_AI_CONFIG
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class LLMBetAnalysis:
-    recommendation: str = "NEUTRAL"
-    confidence: float = 0.0
-    prob_adjustment: float = 0.0
-    reasoning: str = ""
-    key_factors: List[str] = field(default_factory=list)
-    risk_flags: List[str] = field(default_factory=list)
-    model_used: str = ""
-    tokens_used: int = 0
-    is_fallback: bool = False
+from llm_schema import LLMBetAnalysis
 
 
 SYSTEM_PROMPT = """\
-You are a football betting RISK ANALYST. Your sole task is to identify concrete, verifiable red flags
-or advantages that pure statistical models cannot capture — such as confirmed player injuries,
-adverse weather conditions, or significant squad rotation. You are NOT a gatekeeper; you are an objective analyst.
-You MUST respond with ONLY a raw JSON object — no markdown, no explanation, no code blocks.
+You are an objective football match analyst for sports research and education.
+This project is not for gambling. Never give betting, wagering, or financial advice,
+and never suggest that a user should take an action involving money.
+Discuss only match context, estimated probabilities, team form, expected goals,
+confirmed availability, weather, and uncertainty. Do not infer facts that are not supplied.
 
-Required schema:
-{"recommendation":"<STRONG BUY|BUY|NEUTRAL|AVOID>","confidence":<0.0-1.0>,"prob_adjustment":<-0.08 to 0.08>,"reasoning":"<max 80 words>","key_factors":["<factor1>","<factor2>","<factor3>"],"risk_flags":["<risk1>","<risk2>"]}
+Respond only with a raw JSON object using this schema:
+{"recommendation":"NEUTRAL","confidence":<0.0-1.0>,"prob_adjustment":<-0.08 to 0.08>,"risk_score":<0-100>,"reasoning":"<max 80 words>","key_factors":["<factor1>","<factor2>","<factor3>"],"risk_flags":["<uncertainty1>","<uncertainty2>"],"alternative_markets":[],"score_prediction":"<likely scoreline or null>"}
 
-Critical rules:
-- prob_adjustment STRICTLY -0.08 to +0.08.
-- Apply POSITIVE prob_adjustment when you identify a concrete contextual advantage (e.g. key injury to opponent, strong home form run, favorable conditions).
-- Apply NEGATIVE prob_adjustment ONLY for confirmed concrete red flags: key player injury, extreme weather, major squad rotation.
-- Do NOT apply negative adjustment based on uncertainty alone — default to 0.0 when no concrete red flag exists.
-- confidence: 0.5=uncertain, 0.65=fairly confident, 0.80=very confident.
-- STRONG BUY: clear contextual advantage AND confidence>=0.70.
-- BUY: positive contextual factors AND confidence>=0.60.
-- NEUTRAL: when no concrete red flag or advantage is identified.
-- AVOID: ONLY when a specific, concrete red flag is confirmed (injury, weather, rotation).
-- Do NOT hallucinate specific match results, scores, or player stats.
+Rules:
+- recommendation must always be "NEUTRAL"; it is a compatibility field, not advice.
+- Adjust probabilities only for concrete contextual facts; otherwise use 0.0.
+- Keep confidence calibrated and describe important uncertainty.
+- Do not provide market suggestions, betting language, or monetary values.
+- Do not hallucinate results, scores, player statistics, injuries, or other facts.
 - OUTPUT ONLY THE JSON OBJECT.
 """
 
@@ -66,9 +52,10 @@ def build_match_prompt(
     sharpness_score: float = 0.5,
     steam_flag: str = "STABLE",
     confidence_score: float = 0.5,
+    external_context: Optional[str] = None,
 ) -> str:
     outcome_lines = "\n".join(
-        f"  - {o['name']}: odds {o['best_odds']:.2f} | fair prob {o['fair_prob'] * 100:.1f}%"
+        f"  - {o['name']}: estimated probability {o['fair_prob'] * 100:.1f}%"
         for o in all_outcomes
     )
     kick_label = f"in {hours_until:.1f} hours"
@@ -89,22 +76,32 @@ MATCH: {home_team} vs {away_team}
 LEAGUE: {league}
 KICK-OFF: {kick_label}
 
-MARKET: {market_label}
-TARGET OUTCOME: {outcome_name} @ {market_odds:.2f} (fair prob {fair_prob * 100:.1f}%)
+ANALYSIS AREA: {market_label}
+OUTCOME UNDER REVIEW: {outcome_name} (estimated probability {fair_prob * 100:.1f}%)
 
-MARKET CONTEXT:
-  Overround: {overround_pct_val:.1f}% | Market Quality: {market_quality}
-  Bookmakers sampled: {num_bookmakers}{steam_note}
+DATA CONTEXT:
+  Data quality: {market_quality}
+  Independent data sources sampled: {num_bookmakers}{steam_note}
 
 ALL OUTCOMES:
 {outcome_lines}
 
-TASK: Identify concrete red flags or advantages for {outcome_name} in {league}.
-1. Look for confirmed red flags: key player injuries, adverse weather, significant squad rotation
-2. Look for concrete advantages: opponent key injury, strong recent home/away form streak
-3. Apply prob_adjustment only when a specific, verifiable factor exists — not based on uncertainty
-4. Default to prob_adjustment=0.0 and NEUTRAL when no concrete factor is identified
-"""
+TASK: Summarize relevant football context and uncertainty for {outcome_name} in {league}.
+Do not provide any wagering recommendation. Apply a probability adjustment only when
+a specific, verifiable fact supports it; otherwise use 0.0.
+{_external_context_block(external_context)}"""
+
+
+def _external_context_block(external_context: Optional[str]) -> str:
+    """Return the ADDITIONAL CONTEXT prompt section, or empty string if None."""
+    if not external_context:
+        return ""
+    return (
+        "\nADDITIONAL CONTEXT (from API-Football, treat as supplementary — verify plausibility, "
+        "do not treat as ground truth, ignore if irrelevant to your assessment):\n"
+        + external_context
+        + "\n"
+    )
 
 
 class GeminiAI:
@@ -143,6 +140,7 @@ class GeminiAI:
         sharpness_score: float = 0.5,
         steam_flag: str = "STABLE",
         confidence_score: float = 0.5,
+        external_context: Optional[str] = None,
     ) -> LLMBetAnalysis:
         if not self.cfg.api_key or self.cfg.api_key in (
             "",
@@ -169,7 +167,10 @@ class GeminiAI:
             sharpness_score,
             steam_flag,
             confidence_score,
+            external_context,
         )
+
+        use_search = getattr(self.cfg, "enable_search", True)
 
         payload = {
             "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -179,6 +180,8 @@ class GeminiAI:
                 "maxOutputTokens": self.cfg.max_tokens,
             },
         }
+        if use_search:
+            payload["tools"] = [{"googleSearchRetrieval": {}}]
 
         url = self.BASE_URL.format(model=self.cfg.model)
         params = {"key": self.cfg.api_key}
@@ -191,6 +194,19 @@ class GeminiAI:
                         data = await resp.json()
                         return self._parse_response(data)
                     elif resp.status == 429:
+                        text = await resp.text()
+                        if "quota" in text.lower() or "resource_exhausted" in text.lower():
+                            if "tools" in payload:
+                                logger.warning(
+                                    "Gemini search grounding quota exceeded. Retrying WITHOUT search tools..."
+                                )
+                                del payload["tools"]
+                                try:
+                                    self.cfg.enable_search = False
+                                except Exception:
+                                    pass
+                                continue
+
                         wait = 2**attempt * 3
                         logger.warning(
                             "Gemini rate limit (attempt %s/3). Menunggu %ds...",
@@ -207,6 +223,11 @@ class GeminiAI:
                             attempt + 1,
                             wait,
                         )
+                        if attempt == 2:
+                            return LLMBetAnalysis(
+                                is_fallback=True,
+                                reasoning=f"Gemini sementara tidak tersedia (HTTP {resp.status}).",
+                            )
                         await asyncio.sleep(wait)
                         continue
                     elif resp.status == 400:
@@ -283,6 +304,7 @@ class GeminiAI:
             prob_adjustment = max(
                 -0.08, min(0.08, float(parsed.get("prob_adjustment", 0.0)))
             )
+            risk_score = max(0.0, min(100.0, float(parsed.get("risk_score", 50.0))))
             recommendation = str(parsed.get("recommendation", "NEUTRAL")).upper()
 
             if "STRONG" in recommendation:
@@ -298,9 +320,12 @@ class GeminiAI:
                 recommendation=recommendation,
                 confidence=confidence,
                 prob_adjustment=prob_adjustment,
+                risk_score=risk_score,
                 reasoning=str(parsed.get("reasoning", "")),
                 key_factors=list(parsed.get("key_factors", [])),
                 risk_flags=list(parsed.get("risk_flags", [])),
+                alternative_markets=list(parsed.get("alternative_markets", [])),
+                score_prediction=parsed.get("score_prediction") or None,
                 model_used=self.cfg.model,
                 tokens_used=tokens_used,
                 is_fallback=False,
@@ -365,6 +390,8 @@ class GeminiBatchAnalyzer:
             for o in best_mkt.outcomes
         ]
 
+
+
         result = await self.client.analyze_bet(
             home_team=match.home_team,
             away_team=match.away_team,
@@ -414,16 +441,28 @@ class GeminiBatchAnalyzer:
             best_mkt.ai_prob = round(adjusted_prob, 4)
             best_mkt.ai_signal = _llm_signal_label(result)
 
-            from analyzer import expected_value_pct, kelly_fraction
+            from analyzer import expected_value_pct
 
             new_ev = expected_value_pct(adjusted_prob, best_mkt.best_odds)
             best_mkt.best_ev_pct = round(new_ev, 2)
             match.top_bet_ev = best_mkt.best_ev_pct
 
-            new_kelly = kelly_fraction(adjusted_prob, best_mkt.best_odds)
-            best_mkt.kelly_pct = round(new_kelly * 100, 2)
-            best_mkt.kelly_stake = round(new_kelly * ANALYSIS_CONFIG.bankroll, 2)
-            match.top_bet_kelly = best_mkt.kelly_pct
+            from analyzer import compute_cqs, cqs_grade
+
+            new_cqs = compute_cqs(
+                ev_pct=best_mkt.best_ev_pct,
+                data_confidence=best_mkt.data_confidence,
+                league_mult=best_mkt.league_multiplier,
+                risk_score=result.risk_score if result.risk_score is not None else getattr(best_mkt, "risk_score", 0.0),
+                xg_signal=getattr(best_mkt, "xg_signal", "XG_UNAVAILABLE"),
+                n_books=best_mkt.num_books_market,
+                steam_flag=best_mkt.steam_flag,
+            )
+            new_grade = cqs_grade(new_cqs)
+            best_mkt.cqs = new_cqs
+            best_mkt.cqs_grade = new_grade
+            match.cqs = new_cqs
+            match.cqs_grade = new_grade
 
 
 def _llm_signal_label(result: LLMBetAnalysis) -> str:

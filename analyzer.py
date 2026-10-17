@@ -1,10 +1,9 @@
-
 import logging
 import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from config import (
     ANALYSIS_CONFIG,
@@ -12,6 +11,11 @@ from config import (
     get_league_min_edge,
     get_league_multiplier,
 )
+
+from probability_engine import ProbabilityEngine, remove_vig_power
+from calibration import CalibrationLayer
+from mispricing_detector import MispricingDetector
+from risk_engine import RiskEngine
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +52,17 @@ class MarketAnalysis:
     best_ev_pct: float = 0.0
     fair_prob: float = 0.0
 
+    # Pricing Engine fields
+    raw_prob: float = 0.0
+    calibrated_prob: float = 0.0
+    implied_prob: float = 0.0
+    model_confidence: float = 0.0
+    calibration_confidence: float = 0.0
+    market_agreement: str = "NEUTRAL"
+    data_quality_score: float = 0.0
+
     ai_prob: float = 0.0
     ai_signal: str = "NEUTRAL"
-
-    kelly_pct: float = 0.0
-    kelly_stake: float = 0.0
 
     rating: str = "—"
 
@@ -94,8 +104,11 @@ class MatchAnalysis:
     top_bet_outcome: Optional[str] = None
     top_bet_odds: float = 0.0
     top_bet_ev: float = 0.0
-    top_bet_kelly: float = 0.0
     top_bet_book: str = ""
+
+    # pricing metrics
+    cqs: float = 0.0
+    cqs_grade: str = ""
 
     @property
     def match_label(self) -> str:
@@ -107,9 +120,6 @@ class MatchAnalysis:
             return datetime.fromisoformat(self.commence_time.replace("Z", "+00:00"))
         except ValueError:
             return datetime.now(timezone.utc)
-
-    cqs: float = 0.0
-    cqs_grade: str = ""
 
     @property
     def has_value(self) -> bool:
@@ -128,57 +138,20 @@ def decimal_to_prob(odds: float) -> float:
 
 
 def remove_vig(implied_probs: List[float]) -> List[float]:
-    total = sum(implied_probs)
-    if total <= 1.0:
-        return implied_probs
-
-    low, high = 1.0, 5.0
-    k = 1.0
-    for _ in range(30):
-        k = (low + high) / 2
-        s = sum(p**k for p in implied_probs)
-        if s > 1.0:
-            low = k
-        else:
-            high = k
-
-    return [p**k for p in implied_probs]
+    """Helper preserving Shin's de-vig algorithm signature."""
+    return remove_vig_power(implied_probs)
 
 
 def expected_value_pct(
     fair_prob: float, decimal_odds: float, is_lay: bool = False
 ) -> float:
-
     fair_prob = max(0.001, min(0.999, fair_prob))
-
     if is_lay:
-        return (1 - (fair_prob * decimal_odds)) * 100
-
-    return (fair_prob * decimal_odds - 1) * 100
-
-
-def kelly_fraction(
-    fair_prob: float, decimal_odds: float, fraction: float = None, is_lay: bool = False
-) -> float:
-
-    fair_prob = max(0.001, min(0.999, fair_prob))
-    fraction = fraction or ANALYSIS_CONFIG.kelly_fraction
-
-    if is_lay:
-        full_kelly = 1.0 - (fair_prob * decimal_odds)
-    else:
-        b = decimal_odds - 1.0
-        p = fair_prob
-        q = 1.0 - p
-        if b <= 0 or p <= 0:
+        liability = decimal_odds - 1.0
+        if liability <= 0:
             return 0.0
-        full_kelly = (b * p - q) / b
-
-    if full_kelly <= 0:
-        return 0.0
-
-    fractional = full_kelly * fraction
-    return min(fractional, ANALYSIS_CONFIG.max_kelly_pct / 100.0)
+        return ((1.0 - fair_prob * decimal_odds) / liability) * 100
+    return (fair_prob * decimal_odds - 1) * 100
 
 
 def format_outcome_name(outcome: Dict, market_key: str) -> str:
@@ -192,46 +165,13 @@ def format_outcome_name(outcome: Dict, market_key: str) -> str:
     return f"{name} {point}"
 
 
-def weighted_fair_prob(
-    outcome_name: str,
-    bookmakers: List[Dict],
-    market_key: str,
-) -> Tuple[float, int]:
-    probs = []
-    weights = []
-
-    for book in bookmakers:
-        trust = BOOKMAKER_TRUST.get(book.get("key", ""), 0.70)
-        for market in book.get("markets", []):
-            if market["key"] != market_key:
-                continue
-            outcomes = market.get("outcomes", [])
-            mkt_probs = [decimal_to_prob(o["price"]) for o in outcomes]
-            fair = remove_vig(mkt_probs)
-            for i, outcome in enumerate(outcomes):
-                if format_outcome_name(outcome, market_key) == outcome_name:
-                    probs.append(fair[i])
-                    weights.append(trust)
-                    break
-
-    if not probs:
-        return 0.0, 0
-
-    total_weight = sum(weights)
-    wp = sum(p * w for p, w in zip(probs, weights)) / total_weight
-    return wp, len(probs)
-
-
 def market_sharpness(overround: float, n_books: int) -> float:
-
     vig_score = max(0.0, 1.0 - (overround - 1.0) * 10.0)
-
     books_score = min(1.0, n_books / 8.0)
-
     return round((vig_score * 0.6 + books_score * 0.4), 3)
 
 
-def steam_detection(all_odds: List[float], sharp_odds: Optional[float] = None) -> str:
+def steam_detection(all_odds: List[float]) -> str:
     if len(all_odds) < 2:
         return "STABLE"
     spread = max(all_odds) - min(all_odds)
@@ -248,13 +188,9 @@ def steam_detection(all_odds: List[float], sharp_odds: Optional[float] = None) -
 
 
 def data_confidence(sharpness: float, n_books: int, overround: float) -> float:
-
     books_score = min(1.0, n_books / 6.0)
-
     sharpness_score = sharpness
-
     overround_score = max(0.0, min(1.0, (1.12 - overround) / 0.09))
-
     score = (books_score * 0.40) + (sharpness_score * 0.35) + (overround_score * 0.25)
     return round(min(1.0, max(0.0, score)), 3)
 
@@ -262,16 +198,20 @@ def data_confidence(sharpness: float, n_books: int, overround: float) -> float:
 def edge_confidence(ev_pct: float, data_conf: float) -> float:
     if ev_pct <= 0:
         return 0.0
-
-    import math
-
     ev_scale = 1.0 - math.exp(-ev_pct / 8.0)
-
     return round(min(data_conf, ev_scale * data_conf + ev_scale * 0.3), 3)
 
 
-def confidence_score(ev_pct: float, sharpness: float, n_books: int) -> float:
-    return data_confidence(sharpness, n_books, 1.05)
+def time_confidence_factor(hours_until: float) -> float:
+    if hours_until < 0.5:
+        return 0.60
+    if hours_until < 1.0:
+        return 0.85
+    if hours_until <= 6.0:
+        return 1.00
+    if hours_until <= 12.0:
+        return 0.90
+    return 0.80
 
 
 def compute_cqs(
@@ -283,15 +223,12 @@ def compute_cqs(
     n_books: int = 3,
     steam_flag: str = "STABLE",
 ) -> float:
-
     ev_comp = min(100.0, (1.0 - math.exp(-ev_pct / 10.0)) * 100.0)
-
     data_comp = min(100.0, data_confidence * 100.0)
-
     league_comp = max(0.0, min(100.0, (league_mult - 0.40) / 0.60 * 100.0))
 
     if risk_score > 0:
-        risk_comp = max(0.0, (10.0 - risk_score) / 10.0 * 100.0)
+        risk_comp = max(0.0, (100.0 - risk_score) / 100.0 * 100.0)
     else:
         risk_comp = 50.0
 
@@ -336,98 +273,89 @@ def cqs_grade(cqs: float) -> str:
         return "SKIP"
 
 
-class AIBettingModel:
-
-    def analyze_outcome(
-        self,
-        outcome_name: str,
-        best_odds: float,
-        fair_prob: float,
-        all_odds: List[float],
-        market_overround: float,
-        n_books: int = 3,
-    ) -> Tuple[float, str, float]:
-        fair_prob = max(0.001, min(0.999, fair_prob))
-        if best_odds <= 1:
-            return fair_prob, "NEUTRAL", 0.0
-
-        if best_odds > ANALYSIS_CONFIG.max_odds:
-            return fair_prob, "NEUTRAL", 0.0
-
-        ai_prob = fair_prob
-
-        sharp = market_sharpness(market_overround, n_books)
-        steam = steam_detection(all_odds)
-        d_conf = data_confidence(sharp, n_books, market_overround)
-
-        ev = expected_value_pct(ai_prob, best_odds)
-
-        e_conf = edge_confidence(ev, d_conf)
-
-        if ev >= 8.0 and d_conf >= 0.75 and n_books >= 5:
-            signal = "STRONG BUY ★★★"
-        elif ev >= 5.0 and d_conf >= 0.65 and n_books >= 4:
-            signal = "BUY ★★"
-        elif ev >= ANALYSIS_CONFIG.min_edge_pct and d_conf >= 0.55:
-            signal = "WATCH ★"
-        elif ev <= -3.0:
-            signal = "AVOID ✗"
-        else:
-            signal = "NEUTRAL"
-
-        if steam == "STEAM" and ev >= 5.0 and signal == "WATCH ★" and n_books >= 6:
-            signal = "BUY ★★"
-
-        return max(0.001, min(0.999, ai_prob)), signal, d_conf
-
-
 class BettingAnalyzer:
 
     def __init__(self):
-        self.ai_model = AIBettingModel()
-        self.config = ANALYSIS_CONFIG
+        self.prob_engine = ProbabilityEngine()
+        self.calibration_layer = CalibrationLayer()
+        self.detector = MispricingDetector(
+            min_edge_pct=ANALYSIS_CONFIG.min_edge_pct,
+            min_ev_pct=getattr(ANALYSIS_CONFIG, "min_ev_pct", 2.0)
+        )
+        self.risk_engine = RiskEngine()
 
-    def incorporate_xg_signal(
+    def analyze_outrights(
         self,
-        fair_prob: float,
-        xg_context: Optional[dict],
-        weight_bookmaker: float = 0.75,
-        weight_xg: float = 0.25,
-        outcome_name: str = "",
-        home_team: str = "",
-        away_team: str = "",
-    ) -> Tuple[float, str]:
-        if not xg_context:
-            return fair_prob, "XG_UNAVAILABLE"
+        progression_probs: Dict[str, Dict[str, float]],
+        outright_odds: Dict[str, float],
+        market_type: str = "winner"
+    ) -> List[Dict[str, Any]]:
+        """
+        Analyze outright odds against Monte Carlo progression probabilities.
+        Returns a list of value outrights ranked by EV.
+        """
+        value_outrights = []
+        for team, probs in progression_probs.items():
+            prob_key = "champion_prob" if market_type == "winner" else "qualify_prob"
+            true_prob = probs.get(prob_key, 0.0)
+            odds = outright_odds.get(team, 0.0)
+            
+            if odds <= 1.0 or true_prob <= 0.0:
+                continue
+                
+            calibrated_p = self.calibration_layer.calibrate(true_prob, method="platt")
+            has_val, implied_p, edge_pct, ev_pct = self.detector.check_outcome(odds, calibrated_p)
+            if has_val:
+                value_outrights.append({
+                    "team": team,
+                    "market": "Outright Winner" if market_type == "winner" else "Group Qualification",
+                    "odds": odds,
+                    "true_prob": calibrated_p,
+                    "raw_prob": true_prob,
+                    "implied_prob": implied_p,
+                    "edge_pct": edge_pct,
+                    "ev_pct": ev_pct
+                })
+        
+        value_outrights.sort(key=lambda x: x["ev_pct"], reverse=True)
+        return value_outrights
 
-        xg_implied_prob = None
-        if outcome_name and outcome_name == home_team:
-            xg_implied_prob = xg_context.get("xg_implied_home_prob")
-        elif outcome_name and outcome_name == away_team:
-            xg_implied_prob = xg_context.get("xg_implied_away_prob")
-        elif outcome_name and outcome_name.lower() == "draw":
-            xg_implied_prob = xg_context.get("xg_implied_draw_prob")
-
-        if xg_implied_prob is None:
-            return fair_prob, "XG_UNAVAILABLE"
-
-        diff = abs(xg_implied_prob - fair_prob)
-        blended_prob = (fair_prob * weight_bookmaker) + (xg_implied_prob * weight_xg)
-
-        if diff < 0.03:
-            return blended_prob, "XG_CONFIRM"
-        elif diff <= 0.08:
-            return blended_prob, "XG_NEUTRAL"
+    def calculate_data_quality_score(
+        self, num_books: int, has_xg: bool, hours_until: float
+    ) -> float:
+        # Bookmaker count (up to 40 pts)
+        books_pts = min(8, num_books) * 5.0
+        # xG Availability (30 pts)
+        xg_pts = 30.0 if has_xg else 0.0
+        # Data freshness (30 pts)
+        if hours_until < 0:
+            freshness_pts = 5.0  # Live match, extremely volatile
+        elif hours_until < 0.5:
+            freshness_pts = 10.0  # Extremely close
+        elif hours_until <= 12.0:
+            freshness_pts = 30.0  # Sweet spot
         else:
-            return blended_prob, "XG_CONFLICT"
+            freshness_pts = 15.0  # Far away
+        return books_pts + xg_pts + freshness_pts
+
+    def calculate_model_confidence(self, probs: Dict[str, float]) -> float:
+        # Simple agreement metric: higher peak probability in ensemble suggests stronger model agreement
+        if not probs:
+            return 0.5
+        max_prob = max(probs.values())
+        return max_prob
 
     def analyze_event(
-        self, event: Dict, xg_context: Optional[dict] = None
+        self,
+        event: Dict,
+        completed_matches: Optional[List[Dict[str, Any]]] = None,
+        xg_context: Optional[dict] = None
     ) -> Optional[MatchAnalysis]:
         bookmakers = event.get("bookmakers", [])
         if xg_context is None:
             xg_context = event.get("xg_context")
-        if len(bookmakers) < self.config.min_bookmakers:
+            
+        if len(bookmakers) < ANALYSIS_CONFIG.min_bookmakers:
             return None
 
         match = MatchAnalysis(
@@ -437,17 +365,19 @@ class BettingAnalyzer:
             home_team=event.get("home_team", ""),
             away_team=event.get("away_team", ""),
             commence_time=event.get("commence_time", ""),
-            hours_until=event.get("hours_until", 99),
+            hours_until=event.get("hours_until", 99.0),
             num_bookmakers=len(bookmakers),
         )
 
-        market_keys: set = set()
+        market_keys = set()
         for book in bookmakers:
             for mkt in book.get("markets", []):
                 market_keys.add(mkt["key"])
 
         for mkt_key in market_keys:
-            analysis = self._analyze_market(mkt_key, event, xg_context)
+            analysis = self._analyze_market(
+                mkt_key, event, completed_matches, xg_context
+            )
             if analysis:
                 match.markets.append(analysis)
 
@@ -455,7 +385,11 @@ class BettingAnalyzer:
         return match
 
     def _analyze_market(
-        self, market_key: str, event: Dict, xg_context: Optional[dict] = None
+        self,
+        market_key: str,
+        event: Dict,
+        completed_matches: Optional[List[Dict[str, Any]]] = None,
+        xg_context: Optional[dict] = None
     ) -> Optional[MarketAnalysis]:
         bookmakers = event.get("bookmakers", [])
         home_team = event.get("home_team", "")
@@ -467,7 +401,7 @@ class BettingAnalyzer:
             "spreads": "Asian Handicap",
         }.get(market_key, market_key.upper())
 
-        outcome_odds_map: Dict[str, List[Tuple[float, str]]] = {}
+        outcome_odds_map = {}
         overrounds = []
         n_books_market = 0
 
@@ -486,7 +420,9 @@ class BettingAnalyzer:
                 for o in outcomes:
                     name = format_outcome_name(o, market_key)
                     price = o["price"]
-                    if price < self.config.min_odds or price > self.config.max_odds:
+                    min_o = ANALYSIS_CONFIG.min_odds
+                    max_o = ANALYSIS_CONFIG.max_odds
+                    if price < min_o or price > max_o:
                         continue
                     if name not in outcome_odds_map:
                         outcome_odds_map[name] = []
@@ -518,101 +454,156 @@ class BettingAnalyzer:
         if not outcome_list:
             return None
 
-        fair_probs: Dict[str, float] = {}
+        # Parse point if market is totals or spreads
+        market_point = None
         for o in outcome_list:
-            wp, _ = weighted_fair_prob(o.name, bookmakers, market_key)
-            fair_probs[o.name] = wp
+            parts = o.name.split()
+            if parts:
+                try:
+                    market_point = float(parts[-1])
+                    break
+                except ValueError:
+                    pass
 
-        total_fair = sum(fair_probs.values())
-        if total_fair > 0:
-            fair_probs = {k: v / total_fair for k, v in fair_probs.items()}
+        # Build raw ensemble probabilities
+        outcomes_odds_dicts = [{"name": o.name, "price": o.best_odds} for o in outcome_list]
+        ensemble_probs = self.prob_engine.build_ensemble(
+            home_team=home_team,
+            away_team=away_team,
+            sport_key=event.get("sport_key", ""),
+            outcomes_odds=outcomes_odds_dicts,
+            xg_context=xg_context,
+            completed_matches=completed_matches,
+            market_key=market_key,
+            point=market_point
+        )
 
-        best_ev, best_out = -999, None
-        best_odds_val, best_book_val = 0, ""
-        best_fair, best_ai_prob = 0, 0
-        best_signal, best_kelly = "NEUTRAL", 0
-        best_conf = 0.0
+        if not ensemble_probs:
+            return None
+
+        # Get de-vigged market probability for comparison/fallback
+        market_probs = {}
+        for o in outcome_list:
+            # Simple de-vigged market prob
+            implied_p = 1.0 / o.best_odds if o.best_odds > 0 else 0.0
+            market_probs[o.name] = implied_p
+        m_total = sum(market_probs.values())
+        if m_total > 0:
+            market_probs = {k: v / m_total for k, v in market_probs.items()}
+
+        best_ev, best_out = -999.0, None
+        best_odds_val, best_book_val = 0.0, ""
+        best_raw_prob, best_calibrated_prob = 0.0, 0.0
+        best_implied_prob = 0.0
         best_steam = "STABLE"
-        best_xg_signal = "XG_UNAVAILABLE"
-        best_xg_blended = None
 
         for o in outcome_list:
-            fp = fair_probs.get(o.name, 0)
-            if fp < self.config.min_implied_prob or fp > self.config.max_implied_prob:
-                continue
+            raw_p = ensemble_probs.get(o.name)
+            if raw_p is None:
+                raw_p = market_probs.get(o.name, 1.0 / len(outcome_list))
 
-            if o.best_odds > self.config.max_odds or o.best_odds < self.config.min_odds:
-                continue
+            # Calibrate raw ensemble probability
+            calibrated_p = self.calibration_layer.calibrate(raw_p, method="platt")
 
-            implied = 1.0 / o.best_odds if o.best_odds > 0 else 0
-            if abs(implied - fp) > 0.40:
-                logger.debug(
-                    "Skipping divergent fair_prob=%.3f implied=%.3f for %s/%s",
-                    fp,
-                    implied,
-                    market_key,
-                    o.name,
-                )
-                continue
-
-            ai_prob, signal, conf = self.ai_model.analyze_outcome(
-                o.name, o.best_odds, fp, o.all_odds, avg_overround, n_books_market
+            # Check value & calculate EV/edge using MispricingDetector
+            has_val, implied_p, edge_pct, ev_pct = self.detector.check_outcome(
+                o.best_odds, calibrated_p
             )
 
-            blended_prob, xg_signal = self.incorporate_xg_signal(
-                fair_prob=ai_prob,
-                xg_context=xg_context,
-                outcome_name=o.name,
-                home_team=home_team,
-                away_team=away_team,
-            )
-
-            eval_prob = blended_prob if xg_signal != "XG_UNAVAILABLE" else ai_prob
-
-            ev = expected_value_pct(eval_prob, o.best_odds)
-            if ev > self.config.max_edge_pct:
-                logger.debug(
-                    "Skipping suspicious edge %.2f%% for %s/%s", ev, market_key, o.name
-                )
+            # Avoid extreme statistical outliers
+            min_p = ANALYSIS_CONFIG.min_implied_prob
+            max_p = ANALYSIS_CONFIG.max_implied_prob
+            min_o = ANALYSIS_CONFIG.min_odds
+            max_o = ANALYSIS_CONFIG.max_odds
+            if calibrated_p < min_p or calibrated_p > max_p:
+                continue
+            if o.best_odds > max_o or o.best_odds < min_o:
                 continue
 
-            if ev > best_ev:
-                best_ev = ev
+            if ev_pct > best_ev:
+                best_ev = ev_pct
                 best_out = o.name
                 best_odds_val = o.best_odds
                 best_book_val = o.bookmaker
-                best_fair = fp
-                best_ai_prob = ai_prob
-                best_signal = signal
-                best_kelly = kelly_fraction(eval_prob, o.best_odds)
-                best_conf = conf
+                best_raw_prob = raw_p
+                best_calibrated_prob = calibrated_p
+                best_implied_prob = implied_p
                 best_steam = steam_detection(o.all_odds)
-                best_xg_signal = xg_signal
-                best_xg_blended = (
-                    blended_prob if xg_signal != "XG_UNAVAILABLE" else None
-                )
 
         if best_out is None:
             return None
 
+        # Data quality
+        has_xg = xg_context is not None
+        dq_score = self.calculate_data_quality_score(
+            num_books=n_books_market,
+            has_xg=has_xg,
+            hours_until=event.get("hours_until", 6.0)
+        )
+
+        # Model and calibration confidence
+        model_conf = self.calculate_model_confidence(ensemble_probs)
+        cal_conf = 1.0 if self.calibration_layer.is_fitted else 0.5
+
+        # Market agreement
+        m_prob = market_probs.get(best_out, 0.0)
+        diff = abs(best_calibrated_prob - m_prob)
+        if diff < 0.03:
+            market_agreement = "STRONG"
+        elif diff < 0.07:
+            market_agreement = "MODERATE"
+        else:
+            market_agreement = "WEAK"
+
         sport_key = event.get("sport_key", "")
         league_mult = get_league_multiplier(sport_key)
-        adjusted_kelly = best_kelly * league_mult
 
-        final_edge_conf = edge_confidence(best_ev, best_conf)
-        if best_xg_signal == "XG_CONFLICT":
-            final_edge_conf = max(0.0, final_edge_conf * 0.90)
+        # Calculate initial Risk Score before AI
+        init_risk = self.risk_engine.calculate_risk_score(
+            sport_key=sport_key,
+            league_multiplier=league_mult,
+            num_books=n_books_market,
+            hours_until=event.get("hours_until", 6.0),
+            steam_flag=best_steam,
+            ai_risk_flags_count=0
+        )
 
+        hours_until = event.get("hours_until", 6.0)
+        time_factor = time_confidence_factor(hours_until)
+        
+        # Rating labels
         rating = "—"
         if best_ev >= 8.0:
             rating = "★★★ STRONG VALUE"
         elif best_ev >= 5.0:
             rating = "★★ GOOD VALUE"
-        elif best_ev >= self.config.min_edge_pct:
+        elif best_ev >= self.detector.min_edge_pct:
             rating = "★ WEAK VALUE"
 
+        # xG indicators
+        xg_signal = "XG_UNAVAILABLE"
+        xg_blended = None
+        if xg_context:
+            xg_implied = None
+            if best_out == home_team:
+                xg_implied = xg_context.get("xg_implied_home_prob")
+            elif best_out == away_team:
+                xg_implied = xg_context.get("xg_implied_away_prob")
+            elif best_out.lower() == "draw":
+                xg_implied = xg_context.get("xg_implied_draw_prob")
+            
+            if xg_implied is not None:
+                x_diff = abs(xg_implied - best_calibrated_prob)
+                if x_diff < 0.03:
+                    xg_signal = "XG_CONFIRM"
+                elif x_diff <= 0.08:
+                    xg_signal = "XG_NEUTRAL"
+                else:
+                    xg_signal = "XG_CONFLICT"
+                xg_blended = (best_calibrated_prob * 0.7) + (xg_implied * 0.3)
+
         home_avg, away_avg = None, None
-        if xg_context and isinstance(xg_context, dict):
+        if xg_context:
             h_stats = xg_context.get("home_stats")
             a_stats = xg_context.get("away_stats")
             if h_stats:
@@ -620,50 +611,60 @@ class BettingAnalyzer:
             if a_stats:
                 away_avg = a_stats.get("avg_xg_for")
 
+        edge_conf = edge_confidence(best_ev, sharp) * time_factor
+
         return MarketAnalysis(
             market_key=market_key,
             market_label=market_label,
             outcomes=outcome_list,
             overround=avg_overround,
-            fair_probs=fair_probs,
+            fair_probs=ensemble_probs,
             best_outcome=best_out,
             best_odds=best_odds_val,
             best_book=best_book_val,
             best_ev_pct=round(best_ev, 2),
-            fair_prob=round(best_fair, 4),
-            ai_prob=round(best_ai_prob, 4),
-            ai_signal=best_signal,
-            kelly_pct=round(adjusted_kelly * 100, 2),
-            kelly_stake=round(adjusted_kelly * ANALYSIS_CONFIG.bankroll, 2),
+            fair_prob=round(best_raw_prob, 4), # base ensemble
+            
+            # Pricing Engine
+            raw_prob=round(best_raw_prob, 4),
+            calibrated_prob=round(best_calibrated_prob, 4),
+            implied_prob=round(best_implied_prob, 4),
+            model_confidence=round(model_conf, 2),
+            calibration_confidence=round(cal_conf, 2),
+            market_agreement=market_agreement,
+            data_quality_score=round(dq_score, 1),
+            
+            ai_prob=round(best_calibrated_prob, 4), # starts as calibrated prob, adjusted by LLM later
+            ai_signal="NEUTRAL",
             league_multiplier=league_mult,
             rating=rating,
             sharpness_score=sharp,
             steam_flag=best_steam,
-            confidence_score=best_conf,
-            data_confidence=best_conf,
-            edge_confidence=final_edge_conf,
+            confidence_score=sharp,
+            data_confidence=sharp,
+            edge_confidence=edge_conf,
             num_books_market=n_books_market,
-            xg_signal=best_xg_signal,
-            xg_blended_prob=best_xg_blended,
+            risk_score=init_risk,
+            xg_signal=xg_signal,
+            xg_blended_prob=xg_blended,
             xg_home_avg=home_avg,
             xg_away_avg=away_avg,
         )
 
     def _find_top_bet(self, match: MatchAnalysis):
-
         league_min_edge = get_league_min_edge(match.sport_key)
-        effective_min_edge = max(self.config.min_edge_pct, league_min_edge)
+        effective_min_edge = max(ANALYSIS_CONFIG.min_edge_pct, league_min_edge)
 
         best = None
         for mkt in match.markets:
-            if mkt.best_ev_pct > (best.best_ev_pct if best else -999):
+            if mkt.best_ev_pct > (best.best_ev_pct if best else -999.0):
                 best = mkt
+
         if best and best.best_ev_pct >= effective_min_edge:
             match.top_bet_market = best.market_label
             match.top_bet_outcome = best.best_outcome
             match.top_bet_odds = best.best_odds
             match.top_bet_ev = best.best_ev_pct
-            match.top_bet_kelly = best.kelly_pct
             match.top_bet_book = best.best_book
 
             cqs = compute_cqs(
@@ -681,25 +682,31 @@ class BettingAnalyzer:
             match.cqs = cqs
             match.cqs_grade = grade
 
-    def analyze_all(self, events: List[Dict]) -> List[MatchAnalysis]:
+    def analyze_all(
+        self,
+        events: List[Dict],
+        completed_matches_by_sport: Optional[Dict[str, List[Dict]]] = None
+    ) -> List[MatchAnalysis]:
         results = []
         for event in events:
             try:
-                analysis = self.analyze_event(event)
+                sport_key = event.get("sport_key", "")
+                completed = completed_matches_by_sport.get(sport_key) if completed_matches_by_sport else None
+                analysis = self.analyze_event(event, completed)
                 if analysis:
                     results.append(analysis)
             except Exception as e:
-                logger.warning("Error analyzing event %s: %s", event.get("id"), e)
+                logger.warning("Error analyzing event %s: %s", event.get("id"), e, exc_info=True)
 
         value_all = sorted(
             [r for r in results if r.has_value],
             key=lambda x: (-x.cqs, -x.top_bet_ev),
         )
 
-        max_per_league = self.config.max_picks_per_league
-        max_total = self.config.max_picks_per_session
-        league_counts: Dict[str, int] = {}
-        selected: List[MatchAnalysis] = []
+        max_per_league = ANALYSIS_CONFIG.max_picks_per_league
+        max_total = ANALYSIS_CONFIG.max_picks_per_session
+        league_counts = {}
+        selected = []
 
         for m in value_all:
             if len(selected) >= max_total:

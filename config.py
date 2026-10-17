@@ -33,21 +33,37 @@ def _get(name: str, default: str = "") -> str:
 ODDS_PROVIDER = _get("ODDS_PROVIDER", "the_odds_api").lower().replace("-", "_")
 THE_ODDS_API_KEY = _get("THE_ODDS_API_KEY", "")
 ODDS_API_IO_KEY = _get("ODDS_API_IO_KEY", "")
+FBREF_ENABLED = os.getenv("FBREF_ENABLED", "true").lower() == "true"
+
+FIXTURE_VALIDATION_ENABLED = os.getenv("FIXTURE_VALIDATION_ENABLED", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+FIXTURE_VALIDATION_ENDPOINT = os.getenv("FIXTURE_VALIDATION_ENDPOINT", "")
+FIXTURE_VALIDATION_API_KEY = os.getenv("FIXTURE_VALIDATION_API_KEY", "")
+FIXTURE_VALIDATION_TIMEOUT_SECONDS = float(os.getenv("FIXTURE_VALIDATION_TIMEOUT_SECONDS", "10"))
+FIXTURE_VALIDATION_TEAM_THRESHOLD = int(os.getenv("FIXTURE_VALIDATION_TEAM_THRESHOLD", "85"))
+FIXTURE_VALIDATION_LEAGUE_THRESHOLD = int(os.getenv("FIXTURE_VALIDATION_LEAGUE_THRESHOLD", "70"))
+FIXTURE_VALIDATION_KICKOFF_TOLERANCE_MINUTES = int(
+    os.getenv("FIXTURE_VALIDATION_KICKOFF_TOLERANCE_MINUTES", "120")
+)
+FIXTURE_VALIDATION_CACHE_TTL_SECONDS = int(os.getenv("FIXTURE_VALIDATION_CACHE_TTL_SECONDS", "300"))
 
 
 @dataclass
 class GoogleAIConfig:
     api_key: str = field(default_factory=lambda: _get("GOOGLE_AI_STUDIO_KEY", ""))
 
-    model: str = "gemini-2.0-flash-lite"
+    model: str = "gemini-3.1-flash-lite"
 
     enabled: bool = True
 
+    enable_search: bool = False
+
     min_ev_for_llm: float = 2.0
 
-    max_concurrent_requests: int = 1
+    max_concurrent_requests: int = 2
 
-    delay_between_calls: float = 10.0
+    delay_between_calls: float = 4.0
 
     timeout_seconds: int = 30
 
@@ -88,7 +104,7 @@ class OllamaAIConfig:
 OLLAMA_AI_CONFIG = OllamaAIConfig()
 
 
-AI_PROVIDER = "github"
+AI_PROVIDER = "google"
 AI_MODEL = "openai/gpt-4o"
 AI_BASE_URL = "https://models.github.ai/inference"
 
@@ -180,39 +196,33 @@ FOOTBALL_SPORTS_BROAD = FOOTBALL_SPORTS_MAJOR + [
 
 @dataclass
 class AnalysisConfig:
-    min_edge_pct: float = 3.0
+    min_edge_pct: float = 2.0
 
     max_edge_pct: float = 15.0
 
-    min_implied_prob: float = 0.22
+    min_implied_prob: float = 0.20
 
     max_implied_prob: float = 0.92
 
-    kelly_fraction: float = 0.5
-
-    max_kelly_pct: float = 3.0
-
-    max_total_stake_per_session: float = 150000.0
-
-    min_bookmakers: int = 4
+    min_bookmakers: int = 3
 
     lookahead_hours: int = 12
 
     ai_confidence_threshold: float = 0.62
 
-    min_odds: float = 1.40
+    min_odds: float = 1.35
 
     max_odds: float = 4.50
 
-    bankroll: float = 1000000.0
-
-    cqs_min_display: float = 45.0
+    cqs_min_display: float = 40.0
     cqs_premium_threshold: float = 70.0
     cqs_standard_threshold: float = 55.0
 
-    max_picks_per_session: int = 8
+    max_picks_per_session: int = 12
 
-    max_picks_per_league: int = 2
+    max_picks_per_league: int = 3
+
+    performance_min_settled: int = 100
 
 
 ANALYSIS_CONFIG = AnalysisConfig()
@@ -238,6 +248,12 @@ BOOKMAKER_TRUST = {
 
 
 LEAGUE_QUALITY_MULTIPLIER: dict = {
+    # International tournaments — deepest bookmaker coverage / sharpest market of the calendar
+    "soccer_uefa_european_championship": 0.95,
+    "soccer_conmebol_copa_america": 0.90,
+    "soccer_uefa_nations_league": 0.85,
+    "soccer_africa_cup_of_nations": 0.75,
+
     "soccer_epl": 1.00,
     "soccer_spain_la_liga": 1.00,
     "soccer_germany_bundesliga": 1.00,
@@ -284,18 +300,18 @@ LEAGUE_QUALITY_DEFAULT_MULTIPLIER: float = 0.40
 
 
 LEAGUE_MIN_EDGE: dict = {
-    1.00: 3.0,
-    0.95: 3.0,
-    0.90: 3.0,
-    0.85: 3.5,
-    0.80: 3.5,
-    0.75: 3.5,
-    0.65: 4.5,
-    0.60: 4.5,
-    0.55: 5.5,
-    0.50: 5.5,
-    0.45: 7.0,
-    0.40: 7.0,
+    1.00: 2.0,
+    0.95: 2.0,
+    0.90: 2.0,
+    0.85: 2.5,
+    0.80: 2.5,
+    0.75: 2.5,
+    0.65: 3.0,
+    0.60: 3.0,
+    0.55: 3.5,
+    0.50: 3.5,
+    0.45: 4.0,
+    0.40: 4.5,
 }
 
 

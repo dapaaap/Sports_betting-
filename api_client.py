@@ -73,8 +73,6 @@ SPORT_NAME_MAP = {
 }
 
 
-LOOKAHEAD_HOURS = ANALYSIS_CONFIG.lookahead_hours
-
 
 class OddsAPIClient:
 
@@ -129,6 +127,11 @@ class OddsAPIClient:
                         logger.warning(
                             "⚠️  Rate limit. Menunggu %ds...", 10 * (attempt + 1)
                         )
+                        await asyncio.sleep(10 * (attempt + 1))
+                        continue
+                    elif resp.status >= 500:
+                        text = await resp.text()
+                        logger.warning("API 5xx Error %s: %s. Retrying...", resp.status, text[:200])
                         await asyncio.sleep(10 * (attempt + 1))
                         continue
                     else:
@@ -267,7 +270,7 @@ class OddsAPIClient:
                 )
                 hours_until = (commence_time - now).total_seconds() / 3600
 
-                if 0 < hours_until <= LOOKAHEAD_HOURS:
+                if 0 < hours_until <= ANALYSIS_CONFIG.lookahead_hours:
                     event["hours_until"] = round(hours_until, 2)
                     event["commence_utc"] = commence_time
                     event["is_live"] = False
@@ -375,6 +378,11 @@ class OddsAPIIOClient:
                         )
                         await asyncio.sleep(wait)
                         continue
+                    if resp.status >= 500:
+                        text = await resp.text()
+                        logger.warning("Odds-API.io 5xx Error %s: %s. Retrying...", resp.status, text[:200])
+                        await asyncio.sleep(10 * (attempt + 1))
+                        continue
                     text = await resp.text()
                     logger.warning("Odds-API.io HTTP %s: %s", resp.status, text[:200])
                     return None
@@ -393,7 +401,7 @@ class OddsAPIIOClient:
         now = datetime.now(timezone.utc)
         from_dt = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         to_dt = (
-            (now + timedelta(hours=LOOKAHEAD_HOURS))
+            (now + timedelta(hours=ANALYSIS_CONFIG.lookahead_hours))
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z")
@@ -672,7 +680,7 @@ class MockAPIClient:
         ]
 
         for home, away, sport_key, sport_name, hours in sample_matches:
-            if hours > LOOKAHEAD_HOURS:
+            if hours > ANALYSIS_CONFIG.lookahead_hours:
                 continue
             commence = now + timedelta(hours=hours)
 

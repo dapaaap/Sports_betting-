@@ -1,18 +1,15 @@
-
 import argparse
 import asyncio
 import logging
 import os
+import random
 import sys
-import time
+from datetime import datetime
 from typing import List, Optional
 
-from rich import print as rprint
-from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm, Prompt
-from rich.rule import Rule
+from rich.prompt import Prompt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,63 +17,93 @@ from analyzer import BettingAnalyzer, MatchAnalysis
 from api_client import MockAPIClient, OddsAPIClient, OddsAPIIOClient
 from config import (
     ANALYSIS_CONFIG,
-    FOOTBALL_SPORTS_MAJOR,
+    FBREF_ENABLED,
+    FIXTURE_VALIDATION_API_KEY,
+    FIXTURE_VALIDATION_CACHE_TTL_SECONDS,
+    FIXTURE_VALIDATION_ENABLED,
+    FIXTURE_VALIDATION_ENDPOINT,
+    FIXTURE_VALIDATION_KICKOFF_TOLERANCE_MINUTES,
+    FIXTURE_VALIDATION_LEAGUE_THRESHOLD,
+    FIXTURE_VALIDATION_TEAM_THRESHOLD,
+    FIXTURE_VALIDATION_TIMEOUT_SECONDS,
     GITHUB_AI_CONFIG,
     GOOGLE_AI_CONFIG,
     MARKET_CONFIG,
-    MAX_BETS_DISPLAYED,
     ODDS_API_IO_KEY,
     ODDS_PROVIDER,
-    OLLAMA_AI_CONFIG,
     REFRESH_INTERVAL_SECONDS,
-    SHOW_ALL_MARKETS,
     THE_ODDS_API_KEY,
 )
 from display import (
     console,
     print_all_markets,
     print_banner,
-    print_bet_slip,
     print_llm_insights,
     print_match_detail,
-    print_mispricing_report,
+    print_match_analysis_table,
     print_statistics,
     print_top10_upcoming,
-    print_value_bets_table,
-    print_wr_report,
 )
-from fetch_health import STALE_WARNING_MINUTES, FetchHealthReport, get_cached_events
+from fetch_health import FetchHealthReport, get_cached_events
 from github_ai import GitHubBatchAnalyzer
 from google_ai import GeminiBatchAnalyzer
-from ollama_ai import OllamaBatchAnalyzer
-from portfolio import PortfolioManager
-from tracker import log_picks
+from validator import FixtureValidator
 
 try:
     from understat_client import UnderstatEnricher
-
-    XG_UNDERSTAT_AVAILABLE = True
 except ImportError:
-    XG_UNDERSTAT_AVAILABLE = False
+    UnderstatEnricher = None
 
 try:
     from fbref_client import FBrefEnricher
-
-    XG_FBREF_AVAILABLE = True
 except ImportError:
-    XG_FBREF_AVAILABLE = False
-
-XG_AVAILABLE = XG_UNDERSTAT_AVAILABLE or XG_FBREF_AVAILABLE
+    FBrefEnricher = None
 
 XG_ENABLED = True
+XG_AVAILABLE = UnderstatEnricher is not None or FBrefEnricher is not None
 
-logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+_log_dir = os.path.dirname(os.path.abspath(__file__))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(os.path.join(_log_dir, "bot.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logging.getLogger().handlers[-1].setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-if not XG_UNDERSTAT_AVAILABLE:
-    logger.warning("understat not installed — Understat xG disabled")
-if not XG_FBREF_AVAILABLE:
-    logger.warning("fbref_client deps missing — FBref xG disabled")
+
+def generate_mock_completed_matches(sport_key: str) -> List[dict]:
+    """Generate reproducible sample results for local form and xG analysis."""
+    teams_by_sport = {
+        "soccer_epl": ["Manchester City", "Arsenal", "Liverpool", "Chelsea", "Manchester United", "Tottenham", "Aston Villa", "Newcastle"],
+        "soccer_spain_la_liga": ["Real Madrid", "Barcelona", "Atletico Madrid", "Sevilla", "Real Sociedad", "Real Betis", "Villarreal", "Valencia"],
+        "soccer_germany_bundesliga": ["Bayern Munich", "Borussia Dortmund", "Bayer Leverkusen", "RB Leipzig", "Eintracht Frankfurt", "VfB Stuttgart", "Freiburg", "Wolfsburg"],
+        "soccer_italy_serie_a": ["Juventus", "Inter Milan", "AC Milan", "Napoli", "Roma", "Lazio", "Atalanta", "Fiorentina"],
+        "soccer_france_ligue_one": ["PSG", "Marseille", "Monaco", "Lille", "Lyon", "Lens", "Rennes", "Nice"],
+        "soccer_netherlands_eredivisie": ["Ajax", "PSV", "Feyenoord", "AZ Alkmaar", "Twente", "Utrecht"],
+        "soccer_portugal_primeira_liga": ["Porto", "Benfica", "Sporting CP", "Braga"],
+    }
+    teams = teams_by_sport.get(sport_key, ["Team A", "Team B", "Team C", "Team D"])
+    random.seed(42)
+    matches = []
+    for day in range(1, 31):
+        home, away = random.sample(teams, 2)
+        matches.append(
+            {
+                "date": f"2026-06-{day:02d}",
+                "home_team": home,
+                "away_team": away,
+                "home_goals": random.randint(0, 4),
+                "away_goals": random.randint(0, 4),
+                "home_xg": round(random.uniform(0.5, 3.0), 2),
+                "away_xg": round(random.uniform(0.5, 3.0), 2),
+            }
+        )
+    return matches
 
 
 async def fetch_and_analyze(
@@ -84,13 +111,13 @@ async def fetch_and_analyze(
     use_ai: bool = True,
     use_xg: bool = True,
 ) -> tuple:
-
     if use_mock:
-        ClientClass = MockAPIClient
+        client_class = MockAPIClient
     elif ODDS_PROVIDER in ("odds_api_io", "odds-api-io", "oddsapiio"):
-        ClientClass = OddsAPIIOClient
+        client_class = OddsAPIIOClient
     else:
-        ClientClass = OddsAPIClient
+        client_class = OddsAPIClient
+
     analyzer = BettingAnalyzer()
     api_remaining = None
     fetch_health: Optional[FetchHealthReport] = None
@@ -102,105 +129,92 @@ async def fetch_and_analyze(
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Fetching football markets...", total=None)
-
-        async with ClientClass() as client:
+        task = progress.add_task("Loading match data...", total=None)
+        async with client_class() as client:
             events = await client.fetch_all_football_markets()
-            if hasattr(client, "remaining_requests"):
-                api_remaining = client.remaining_requests
-
-            if hasattr(client, "fetch_health") and client.fetch_health:
-                fetch_health = client.fetch_health
-                fetch_health.classify_no_results(
-                    n_matches=len(events),
-                    n_value_bets=0,
-                )
+            api_remaining = getattr(client, "remaining_requests", None)
+            fetch_health = getattr(client, "fetch_health", None)
 
         if not events and not use_mock:
             cached = get_cached_events()
             if cached:
-                events, fetch_health, cache_age_s = cached
-                cache_age_m = cache_age_s / 60.0
+                events, fetch_health, cache_age_seconds = cached
                 console.print(
-                    f"\n[bold yellow]⚠ API returned 0 events — using cached odds data "
-                    f"({cache_age_m:.1f}m old)[/bold yellow]\n"
-                )
-                logger.warning(
-                    "Live fetch returned 0 events. Fell back to TTL cache (age=%.1fs).",
-                    cache_age_s,
+                    f"\n[yellow]Using cached match data "
+                    f"({cache_age_seconds / 60:.1f} minutes old).[/yellow]"
                 )
             else:
-                console.print(
-                    "\n[bold red]❌ API returned 0 events and no cache available.[/bold red]\n"
-                )
+                console.print("\n[red]No match data is currently available.[/red]")
 
-        from datetime import datetime
+        if events and not use_mock and FIXTURE_VALIDATION_ENABLED:
+            if not FIXTURE_VALIDATION_ENDPOINT:
+                logger.error(
+                    "Fixture validation enabled but FIXTURE_VALIDATION_ENDPOINT is empty"
+                )
+                events = []
+            else:
+                progress.update(task, description="Validating fixtures...")
+                validator = FixtureValidator(
+                    endpoint=FIXTURE_VALIDATION_ENDPOINT,
+                    api_key=FIXTURE_VALIDATION_API_KEY,
+                    timeout_seconds=FIXTURE_VALIDATION_TIMEOUT_SECONDS,
+                    team_threshold=FIXTURE_VALIDATION_TEAM_THRESHOLD,
+                    league_threshold=FIXTURE_VALIDATION_LEAGUE_THRESHOLD,
+                    kickoff_tolerance_minutes=FIXTURE_VALIDATION_KICKOFF_TOLERANCE_MINUTES,
+                    cache_ttl_seconds=FIXTURE_VALIDATION_CACHE_TTL_SECONDS,
+                )
+                events = await asyncio.to_thread(validator.filter_fixtures, events)
 
         now = datetime.now()
-        current_season_year = str(now.year if now.month >= 8 else now.year - 1)
+        season_year = str(now.year if now.month >= 8 else now.year - 1)
+        fbref = FBrefEnricher() if (
+            use_xg and FBrefEnricher is not None and FBREF_ENABLED
+        ) else None
 
-        if use_xg and XG_UNDERSTAT_AVAILABLE and events:
-            progress.update(
-                task, description="Enriching matches with xG data (Understat)..."
+        if use_xg and UnderstatEnricher is not None and events:
+            progress.update(task, description="Adding expected-goals context...")
+            events = await UnderstatEnricher().enrich_matches(
+                events, season=season_year
             )
-            understat_enricher = UnderstatEnricher()
-            events = await understat_enricher.enrich_matches(
-                events, season=current_season_year
-            )
+        if fbref is not None and events:
+            progress.update(task, description="Adding team statistics...")
+            season = f"{season_year}-{int(season_year) + 1}"
+            events = fbref.enrich_matches(events, season=season)
 
-        if use_xg and XG_FBREF_AVAILABLE and events:
-            unenriched = sum(1 for e in events if e.get("xg_context") is None)
-            if unenriched > 0:
-                progress.update(
-                    task,
-                    description=f"Enriching {unenriched} matches with xG data (FBref)...",
-                )
-                fbref_enricher = FBrefEnricher()
-                fbref_season = f"{current_season_year}-{int(current_season_year) + 1}"
-                events = fbref_enricher.enrich_matches(events, season=fbref_season)
+        completed_by_sport = {}
+        active_sports = {event.get("sport_key") for event in events}
+        if use_mock:
+            completed_by_sport = {
+                sport: generate_mock_completed_matches(sport)
+                for sport in active_sports
+                if sport
+            }
+        elif fbref is not None:
+            for sport in active_sports:
+                if sport and fbref.is_supported(sport):
+                    try:
+                        season = f"{season_year}-{int(season_year) + 1}"
+                        matches_data = fbref.get_league_matches(sport, season)
+                        if matches_data:
+                            completed_by_sport[sport] = matches_data
+                    except Exception:
+                        logger.exception("Could not load historical match data for %s", sport)
 
         progress.update(task, description=f"Analyzing {len(events)} matches...")
-        results = analyzer.analyze_all(events)
+        results = analyzer.analyze_all(events, completed_by_sport)
 
-        if use_ai and GITHUB_AI_CONFIG.enabled and GITHUB_AI_CONFIG.is_configured:
-            value_count = sum(1 for m in results if m.has_value)
-            if value_count > 0:
-                progress.update(
-                    task,
-                    description=f"[bright_cyan]GPT-4o (GitHub Models) analyzing {value_count} value bets...",
-                )
-                ai_enricher = GitHubBatchAnalyzer()
-                results = await ai_enricher.enrich_matches(results)
-
-        elif use_ai and GOOGLE_AI_CONFIG.enabled and GOOGLE_AI_CONFIG.is_configured:
-            value_count = sum(1 for m in results if m.has_value)
-            if value_count > 0:
-                progress.update(
-                    task,
-                    description=f"[bright_cyan]Gemini AI analyzing {value_count} value bets...",
-                )
-                ai_enricher = GeminiBatchAnalyzer()
-                results = await ai_enricher.enrich_matches(results)
-
-        progress.update(task, description="Applying portfolio risk filter...")
-        _portfolio = PortfolioManager(
-            bankroll=ANALYSIS_CONFIG.bankroll,
-            max_per_match_pct=3.0,
-            session_guidance_rp=ANALYSIS_CONFIG.max_total_stake_per_session,
-        )
-        _portfolio.apply(results)
+        if use_ai and GOOGLE_AI_CONFIG.enabled and GOOGLE_AI_CONFIG.is_configured:
+            progress.update(task, description="Adding contextual match analysis...")
+            results = await GeminiBatchAnalyzer().enrich_matches(results)
+        elif use_ai and GITHUB_AI_CONFIG.enabled and GITHUB_AI_CONFIG.is_configured:
+            progress.update(task, description="Adding contextual match analysis...")
+            results = await GitHubBatchAnalyzer().enrich_matches(results)
 
         if fetch_health:
-            n_value = sum(1 for m in results if m.has_value)
             fetch_health.classify_no_results(
                 n_matches=len(results),
-                n_value_bets=n_value,
+                n_value_bets=len(results),
             )
-
-    if not use_mock:
-        saved = log_picks(results)
-        if saved > 0:
-            logger.info("tracker: %d new picks saved to picks_log.csv", saved)
 
     return results, api_remaining, fetch_health
 
@@ -208,352 +222,207 @@ async def fetch_and_analyze(
 def run_dashboard(
     matches: List[MatchAnalysis],
     api_remaining: Optional[str] = None,
-    fetch_health: Optional["FetchHealthReport"] = None,
+    fetch_health: Optional[FetchHealthReport] = None,
 ):
     console.clear()
     print_banner(api_remaining, fetch_health)
     print_statistics(matches)
-    print_bet_slip(matches)
-    print_value_bets_table(matches)
+    print_match_analysis_table(matches)
     print_llm_insights(matches)
-    print_mispricing_report(matches)
-    if SHOW_ALL_MARKETS:
-        print_all_markets(matches)
 
 
 def show_match_detail(matches: List[MatchAnalysis], query: str):
-    query_lower = query.lower()
+    query_lower = query.casefold()
     found = [
-        m
-        for m in matches
-        if query_lower in m.home_team.lower()
-        or query_lower in m.away_team.lower()
-        or query_lower in m.match_label.lower()
+        match
+        for match in matches
+        if query_lower in match.home_team.casefold()
+        or query_lower in match.away_team.casefold()
+        or query_lower in match.match_label.casefold()
     ]
     if not found:
-        console.print(f"[red]No match found matching: '{query}'[/red]")
+        console.print(f"[red]No match found for '{query}'.[/red]")
         return
     for match in found:
         print_match_detail(match)
 
 
+def export_csv(matches: List[MatchAnalysis]):
+    import csv
+    import time
+
+    filename = f"match_analysis_{int(time.time())}.csv"
+    filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    fields = [
+        "match",
+        "league",
+        "kickoff_utc",
+        "home_probability",
+        "draw_probability",
+        "away_probability",
+        "data_quality_score",
+        "xg_home",
+        "xg_away",
+        "score_estimate",
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        for match in matches:
+            h2h = next(
+                (market for market in match.markets if market.market_key == "h2h"),
+                None,
+            )
+            llm = getattr(match, "llm_analysis", None)
+            xg_market = next(
+                (market for market in match.markets if market.xg_home_avg is not None),
+                None,
+            )
+            writer.writerow(
+                {
+                    "match": match.match_label,
+                    "league": match.sport_name,
+                    "kickoff_utc": match.commence_time,
+                    "home_probability": h2h.fair_probs.get(match.home_team, "") if h2h else "",
+                    "draw_probability": h2h.fair_probs.get("Draw", "") if h2h else "",
+                    "away_probability": h2h.fair_probs.get(match.away_team, "") if h2h else "",
+                    "data_quality_score": max(
+                        (market.data_quality_score for market in match.markets),
+                        default="",
+                    ),
+                    "xg_home": xg_market.xg_home_avg if xg_market else "",
+                    "xg_away": xg_market.xg_away_avg if xg_market else "",
+                    "score_estimate": llm.score_prediction if llm else "",
+                }
+            )
+    console.print(f"[green]Analysis exported to {filepath}[/green]")
+
+
 def interactive_menu(matches: List[MatchAnalysis]):
     global XG_ENABLED
     while True:
-        console.print()
-        mode_tag = (
-            "[bold green]● ACTIVE[/bold green]" if MARKET_CONFIG.mode == "broad" else ""
-        )
-        major_tag = (
-            "[bold green]● ACTIVE[/bold green]" if MARKET_CONFIG.mode == "major" else ""
-        )
         console.print(
-            "[bold bright_cyan]━━━ MENU ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold bright_cyan]"
+            "\n[bold bright_cyan]━━━ ANALYSIS MENU ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold bright_cyan]"
         )
-        console.print("  [white]1[/white] → Refresh dashboard")
-        console.print("  [white]2[/white] → View match detail")
+        console.print("  [white]1[/white] → Refresh analysis")
+        console.print("  [white]2[/white] → View match details")
         console.print("  [white]3[/white] → Filter by league")
-        console.print("  [white]4[/white] → Adjust min edge threshold")
-        console.print("  [white]5[/white] → Export value bets to CSV")
-        console.print(
-            "  [bold bright_yellow]6[/bold bright_yellow] → [bold bright_yellow]Top 10 Best Bets — Next 12 Hours[/bold bright_yellow]"
-        )
-        console.print(
-            f"  [white]7[/white] → Broad Market (all leagues)                  {mode_tag}"
-        )
-        console.print(
-            f"  [white]8[/white] → Major Leagues Only                          {major_tag}"
-        )
-        xg_tag = "[bold green]● ON[/bold green]" if XG_ENABLED else "[dim]○ OFF[/dim]"
-        console.print(
-            f"  [white]9[/white] → Toggle xG Enrichment (Understat)            {xg_tag}"
-        )
-        console.print(
-            "  [dim]Filter: upcoming 12h window | live matches hidden[/dim]"
-        )
-        console.print("  [white]w[/white] → Weekly Report (win rate & P&L)")
+        console.print("  [white]4[/white] → Export match analysis to CSV")
+        console.print("  [white]5[/white] → Upcoming matches overview")
+        mode = "Broad" if MARKET_CONFIG.mode == "broad" else "Major leagues"
+        console.print(f"  [white]6[/white] → Switch league coverage (current: {mode})")
+        xg_status = "ON" if XG_ENABLED else "OFF"
+        console.print(f"  [white]7[/white] → Toggle xG enrichment (currently {xg_status})")
         console.print("  [white]q[/white] → Quit")
-        console.print(
-            "[bold bright_cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold bright_cyan]"
-        )
-
         choice = Prompt.ask("[cyan]Select[/cyan]", default="1")
 
         if choice == "1":
             return "refresh"
-        elif choice == "2":
-            q = Prompt.ask("[cyan]Enter team name or match[/cyan]")
-            show_match_detail(matches, q)
+        if choice == "2":
+            show_match_detail(matches, Prompt.ask("[cyan]Team or match[/cyan]"))
         elif choice == "3":
-            leagues = sorted(set(m.sport_name for m in matches))
-            for i, lg in enumerate(leagues, 1):
-                console.print(f"  [white]{i}[/white] → {lg}")
-            idx = Prompt.ask("[cyan]Select league number[/cyan]")
+            leagues = sorted({match.sport_name for match in matches})
+            for number, league in enumerate(leagues, 1):
+                console.print(f"  {number} → {league}")
             try:
-                league = leagues[int(idx) - 1]
-                filtered = [m for m in matches if m.sport_name == league]
-                console.clear()
-                print_banner()
-                print_value_bets_table(filtered)
+                league = leagues[int(Prompt.ask("[cyan]League number[/cyan]")) - 1]
+                filtered = [match for match in matches if match.sport_name == league]
+                print_match_analysis_table(filtered)
                 print_all_markets(filtered)
             except (IndexError, ValueError):
-                console.print("[red]Invalid selection[/red]")
+                console.print("[red]Invalid selection.[/red]")
         elif choice == "4":
-            new_edge = Prompt.ask(
-                f"[cyan]Min edge % (current: {ANALYSIS_CONFIG.min_edge_pct})[/cyan]",
-                default=str(ANALYSIS_CONFIG.min_edge_pct),
-            )
-            try:
-                ANALYSIS_CONFIG.min_edge_pct = float(new_edge)
-                console.print(
-                    f"[green]Min edge set to {ANALYSIS_CONFIG.min_edge_pct}%[/green]"
-                )
-                return "refresh"
-            except ValueError:
-                console.print("[red]Invalid value[/red]")
-        elif choice == "5":
             export_csv(matches)
+        elif choice == "5":
+            print_top10_upcoming(matches, hours=12)
         elif choice == "6":
-            console.clear()
-            print_banner()
-
-            upcoming_only = [m for m in matches if m.hours_until > 0]
-            print_top10_upcoming(upcoming_only, hours=12)
+            MARKET_CONFIG.mode = "major" if MARKET_CONFIG.mode == "broad" else "broad"
+            return "refresh"
         elif choice == "7":
-            if MARKET_CONFIG.mode == "broad":
-                console.print(
-                    "[yellow]Already in Broad Market mode. Reloading...[/yellow]"
-                )
-            else:
-                MARKET_CONFIG.mode = "broad"
-                console.print(
-                    "[green]✅ Switched to Broad Market mode. Reloading...[/green]"
-                )
-            return "refresh"
-        elif choice == "8":
-            if MARKET_CONFIG.mode == "major":
-                console.print(
-                    "[yellow]Already in Major Leagues mode. Reloading...[/yellow]"
-                )
-            else:
-                MARKET_CONFIG.mode = "major"
-                console.print(
-                    "[green]✅ Switched to Major Leagues mode. Reloading...[/green]"
-                )
-            return "refresh"
-        elif choice == "9":
             if not XG_AVAILABLE:
-                console.print(
-                    "[red]❌ understat module not installed. Run: pip install understat[/red]"
-                )
+                console.print("[yellow]No xG data provider is installed.[/yellow]")
             else:
                 XG_ENABLED = not XG_ENABLED
-                status = "ON" if XG_ENABLED else "OFF"
-                console.print(f"[green]✅ xG Enrichment: {status}[/green]")
-            return "refresh"
-        elif choice.lower() == "w":
-            from tracker import weekly_report
-
-            wk = Prompt.ask(
-                "[cyan]Which week (1=last week, 0=all time)[/cyan]", default="1"
-            )
-            try:
-                weekly_report(weeks_back=int(wk))
-            except ValueError:
-                weekly_report(weeks_back=1)
-        elif choice.lower() == "q":
+                return "refresh"
+        elif choice.casefold() == "q":
             return "quit"
-
-
-def export_csv(matches: List[MatchAnalysis]):
-    import csv
-
-    filename = f"value_bets_{int(time.time())}.csv"
-    filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
-
-    value_bets = [m for m in matches if m.has_value]
-    if not value_bets:
-        console.print("[yellow]No value bets to export.[/yellow]")
-        return
-
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "match",
-                "league",
-                "hours_until",
-                "market",
-                "outcome",
-                "best_odds",
-                "bookmaker",
-                "fair_prob",
-                "ev_pct",
-                "kelly_pct",
-                "kelly_stake",
-            ],
-        )
-        writer.writeheader()
-        for m in value_bets:
-            writer.writerow(
-                {
-                    "match": m.match_label,
-                    "league": m.sport_name,
-                    "hours_until": m.hours_until,
-                    "market": m.top_bet_market,
-                    "outcome": m.top_bet_outcome,
-                    "best_odds": m.top_bet_odds,
-                    "bookmaker": m.top_bet_book,
-                    "fair_prob": "",
-                    "ev_pct": m.top_bet_ev,
-                    "kelly_pct": m.top_bet_kelly,
-                    "kelly_stake": round(
-                        m.top_bet_kelly / 100 * ANALYSIS_CONFIG.bankroll, 2
-                    ),
-                }
-            )
-
-    console.print(
-        f"[green]✅ Exported {len(value_bets)} bets → [bold]{filepath}[/bold][/green]"
-    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="⚽ Sports Betting Intelligence Bot",
+        description="Football match analysis dashboard",
+        epilog=(
+            "Examples:\n"
+            "  python main.py --live\n"
+            "  python main.py --detail Arsenal\n"
+            "  python main.py --watch\n"
+            "  python main.py --lookahead 24"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py                    → Dashboard with mock data (no API key needed)
-  python main.py --live             → Use real API (set THE_ODDS_API_KEY env var)
-  python main.py --watch            → Auto-refresh every 60s
-  python main.py --detail "Arsenal"  → Detailed analysis for Arsenal matches
-  python main.py --edge 3.0         → Override minimum edge threshold
-  python main.py --bankroll 5000    → Set bankroll for Kelly sizing
-  python main.py --lookahead 12    → Only show matches in next 12 hours
-        """,
     )
-    parser.add_argument(
-        "--live", action="store_true", help="Use real API (default: mock data)"
-    )
-    parser.add_argument("--watch", action="store_true", help="Auto-refresh mode")
-    parser.add_argument("--detail", type=str, help="Show detail for a specific match")
-    parser.add_argument("--edge", type=float, help="Override min edge %%")
-    parser.add_argument("--bankroll", type=float, help="Override bankroll amount")
-    parser.add_argument(
-        "--lookahead", type=int, help="Hours to look ahead (default: 48)"
-    )
-    parser.add_argument("--no-menu", action="store_true", help="Skip interactive menu")
-    parser.add_argument(
-        "--no-ai", action="store_true", help="Skip AI enrichment (faster)"
-    )
-    parser.add_argument("--model", type=str, help="Override AI model")
-    parser.add_argument(
-        "--config", action="store_true", help="Show current configuration"
-    )
+    parser.add_argument("--live", action="store_true", help="Use live match data")
+    parser.add_argument("--watch", action="store_true", help="Refresh automatically")
+    parser.add_argument("--detail", type=str, help="Show analysis for a team or match")
+    parser.add_argument("--lookahead", type=int, help="Hours to look ahead")
+    parser.add_argument("--no-menu", action="store_true", help="Do not open the menu")
+    parser.add_argument("--no-ai", action="store_true", help="Skip AI context analysis")
+    parser.add_argument("--model", type=str, help="Choose the AI model")
+    parser.add_argument("--config", action="store_true", help="Show data configuration")
     return parser.parse_args()
 
 
 async def main():
     args = parse_args()
-
-    if args.edge:
-        ANALYSIS_CONFIG.min_edge_pct = args.edge
-    if args.bankroll:
-        ANALYSIS_CONFIG.bankroll = args.bankroll
-
-    ANALYSIS_CONFIG.lookahead_hours = 12
+    if args.lookahead is not None:
+        if args.lookahead <= 0:
+            raise SystemExit("--lookahead must be a positive number of hours")
+        ANALYSIS_CONFIG.lookahead_hours = args.lookahead
 
     if ODDS_PROVIDER in ("odds_api_io", "odds-api-io", "oddsapiio"):
-        active_provider = "Odds-API.io"
-        active_key = ODDS_API_IO_KEY
-        active_key_name = "ODDS_API_IO_KEY"
+        provider, api_key = "Odds-API.io", ODDS_API_IO_KEY
     else:
-        active_provider = "The Odds API"
-        active_key = THE_ODDS_API_KEY
-        active_key_name = "THE_ODDS_API_KEY"
-
-    _key_invalid = not active_key or active_key in ("YOUR_API_KEY_HERE", "")
-
-    if active_provider == "Odds-API.io":
+        provider, api_key = "The Odds API", THE_ODDS_API_KEY
+    key_invalid = not api_key or api_key == "YOUR_API_KEY_HERE"
+    if provider == "Odds-API.io":
         ANALYSIS_CONFIG.min_bookmakers = min(ANALYSIS_CONFIG.min_bookmakers, 3)
 
-    if args.live and _key_invalid:
-        use_mock = True
-    elif args.live:
-        use_mock = False
-    elif _key_invalid:
-        use_mock = True
-    else:
-        use_mock = False
-
-    if use_mock:
-        console.print(
-            "[yellow]⚠️  Running in MOCK MODE (simulated data).\n"
-            f"   -> Set {active_key_name} environment variable for live data.[/yellow]"
-        )
-    else:
-        console.print(
-            f"[dim green]Using live data from {active_provider}[/dim green]"
-        )
-
-    if args.live and _key_invalid:
+    use_mock = not args.live and key_invalid
+    if args.live and key_invalid:
         console.print(
             Panel(
-                "[red]No Odds API key configured![/red]\n\n"
-                f"1. Get a free key for {active_provider}\n"
-                f"2. Set environment variable: [bold]{active_key_name}[/bold]\n\n"
-                "[yellow]Running in MOCK MODE instead...[/yellow]",
-                title="API Key Required",
-                border_style="red",
+                f"Configure the {provider} data API key to use live data. "
+                "Sample data will be used for this run.",
+                title="Live data unavailable",
+                border_style="yellow",
             )
         )
         use_mock = True
-
     if args.config:
-        github_status = (
-            f"[green]CONFIGURED ({GITHUB_AI_CONFIG.model})[/green]"
-            if GITHUB_AI_CONFIG.is_configured
-            else "[yellow]NOT SET — set GITHUB_TOKEN in api_keys.py[/yellow]"
-        )
-        gemini_status = (
-            f"[dim]CONFIGURED ({GOOGLE_AI_CONFIG.model}) — secondary fallback[/dim]"
-            if GOOGLE_AI_CONFIG.is_configured
-            else "[dim]not set[/dim]"
-        )
         console.print(
             Panel(
-                f"[cyan]Odds Provider :[/cyan] {active_provider}\n"
-                f"[cyan]Odds API Key  :[/cyan] {'SET' if active_key else 'NOT SET (mock mode)'}\n"
-                f"[cyan]Mode          :[/cyan] {'MOCK' if use_mock else 'LIVE'}\n"
-                f"[cyan]AI Provider   :[/cyan] [bold]GitHub Models (GPT-4o)[/bold]\n"
-                f"[cyan]AI Status     :[/cyan] {github_status}\n"
-                f"[cyan]AI Base URL   :[/cyan] {GITHUB_AI_CONFIG.base_url}\n"
-                f"[cyan]Gemini (bkp)  :[/cyan] {gemini_status}\n"
-                f"[cyan]xG Enrichment :[/cyan] {'ENABLED (Understat+FBref)' if XG_AVAILABLE and XG_ENABLED else 'DISABLED'}\n"
-                f"[cyan]Min Edge      :[/cyan] {ANALYSIS_CONFIG.min_edge_pct}%\n"
-                f"[cyan]Bankroll      :[/cyan] ${ANALYSIS_CONFIG.bankroll:,.0f}\n"
-                f"[cyan]Kelly Frac    :[/cyan] {ANALYSIS_CONFIG.kelly_fraction} (half kelly)\n"
-                f"[cyan]Lookahead     :[/cyan] {ANALYSIS_CONFIG.lookahead_hours}h\n"
-                f"[cyan]Market Mode   :[/cyan] {MARKET_CONFIG.mode.upper()}\n"
-                f"[cyan]Min Books     :[/cyan] {ANALYSIS_CONFIG.min_bookmakers}\n"
-                f"[cyan]Refresh       :[/cyan] {REFRESH_INTERVAL_SECONDS}s",
-                title="[bold]Configuration[/bold]",
+                f"Data source: {provider}\n"
+                f"Live data key: {'configured' if not key_invalid else 'not configured'}\n"
+                f"Mode: {'sample data' if use_mock else 'live data'}\n"
+                f"AI context: {'enabled' if GOOGLE_AI_CONFIG.is_configured or GITHUB_AI_CONFIG.is_configured else 'not configured'}\n"
+                f"xG enrichment: {'enabled' if XG_AVAILABLE and XG_ENABLED else 'disabled'}\n"
+                f"Look-ahead: {ANALYSIS_CONFIG.lookahead_hours} hours\n"
+                f"League coverage: {MARKET_CONFIG.mode}",
+                title="Analysis configuration",
                 border_style="cyan",
             )
         )
         return
 
-    if hasattr(args, "model") and args.model:
+    if args.model:
+        GOOGLE_AI_CONFIG.model = args.model
         GITHUB_AI_CONFIG.model = args.model
-
-    use_ai = not getattr(args, "no_ai", False)
 
     while True:
         matches, api_remaining, fetch_health = await fetch_and_analyze(
-            use_mock=use_mock, use_ai=use_ai, use_xg=XG_ENABLED
+            use_mock=use_mock,
+            use_ai=not args.no_ai,
+            use_xg=XG_ENABLED,
         )
-
         if args.detail:
             print_banner(api_remaining, fetch_health)
             show_match_detail(matches, args.detail)
@@ -562,45 +431,19 @@ async def main():
 
         if args.watch:
             console.print(
-                f"\n[dim]⏱ Auto-refreshing in {REFRESH_INTERVAL_SECONDS}s... (Ctrl+C to stop)[/dim]"
+                f"\n[dim]Refreshing in {REFRESH_INTERVAL_SECONDS} seconds "
+                "(Ctrl+C to stop)[/dim]"
             )
-            try:
-                await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
-                continue
-            except asyncio.CancelledError:
-                break
-
-        if args.no_menu:
-            break
-
-        action = interactive_menu(matches)
-        if action == "quit":
-            try:
-                from tracker import weekly_report
-
-                report = weekly_report(weeks_back=0, print_output=False)
-                if report and report.get("settled", 0) > 0:
-                    console.print()
-                    console.print(
-                        Rule(
-                            "[bold bright_cyan]SESSION END — PERFORMANCE SUMMARY[/bold bright_cyan]",
-                            style="bright_cyan",
-                        )
-                    )
-                    print_wr_report(report, compact=True)
-            except Exception:
-                pass
-
-            console.print(
-                "\n[bold cyan]👋 Goodbye! Good luck betting responsibly.[/bold cyan]\n"
-            )
-            break
-        elif action == "refresh":
+            await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
             continue
+        if args.no_menu or args.detail:
+            break
+        if interactive_menu(matches) == "quit":
+            break
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        console.print("\n[bold cyan]👋 Interrupted. Goodbye![/bold cyan]\n")
+        console.print("\n[cyan]Analysis stopped.[/cyan]")
