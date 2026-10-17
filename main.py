@@ -372,6 +372,14 @@ def parse_args():
 
 
 async def main():
+    console.print(
+        Panel(
+            "[bold]Proyek ini dibuat untuk belajar dan analisis olahraga saja. "
+            "Tidak ada tujuan untuk berjudi dan tidak memberikan rekomendasi taruhan.[/bold]",
+            title="[bold yellow]Peringatan[/bold yellow]",
+            border_style="yellow",
+        )
+    )
     args = parse_args()
     if args.lookahead is not None:
         if args.lookahead <= 0:

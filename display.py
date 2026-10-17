@@ -72,11 +72,6 @@ def print_banner(
     console.print(
         Panel(Align.center(title), border_style="bright_cyan", padding=(0, 2))
     )
-    console.print(
-        "[yellow]Informational analysis only. This project is not for gambling and "
-        "does not provide wagering recommendations.[/yellow]"
-    )
-
     meta = Text()
     meta.append(
         datetime.now(UTC).strftime("  %a %d %b %Y  %H:%M UTC  "),
